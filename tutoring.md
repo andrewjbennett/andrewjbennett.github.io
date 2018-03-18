@@ -3,6 +3,16 @@ layout: post
 title: Tutorials
 ---
 
+NOTE
+=====
+
+This is copied verbatim from UNSW's tutorial guidelines.
+
+There are parts that I disagree with, and I plan to improve it... some day.
+
+-------------------
+
+
 Tutorials
 =========
 
