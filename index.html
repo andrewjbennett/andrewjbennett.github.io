@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ToolScan CAD — 2D/3D Tool Reconstruction & Gridfinity Generator</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f141c;
+      --panel: #18202c;
+      --panel-alt: #1f2937;
+      --border: #2e3b4e;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #38bdf8;
+      --accent-hover: #0284c7;
+      --success: #10b981;
+      --warn: #f59e0b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 0.75rem 1.25rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }
+    .brand { display: flex; align-items: center; gap: 0.75rem; font-weight: 700; font-size: 1.1rem; }
+    .badge {
+      font-size: 0.72rem;
+      background: rgba(56, 189, 248, 0.15);
+      color: var(--accent);
+      border: 1px solid var(--accent);
+      padding: 0.15rem 0.5rem;
+      border-radius: 4px;
+    }
+    nav.tabs { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+    .tab-btn {
+      background: var(--panel-alt);
+      color: var(--muted);
+      border: 1px solid var(--border);
+      padding: 0.5rem 0.9rem;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.85rem;
+      transition: all 0.15s;
+    }
+    .tab-btn.active, .tab-btn:hover {
+      color: var(--text);
+      border-color: var(--accent);
+      background: rgba(56, 189, 248, 0.12);
+    }
+    main { flex: 1; padding: 1rem; max-width: 1600px; width: 100%; margin: 0 auto; }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: grid; grid-template-columns: 360px 1fr; gap: 1rem; align-items: start; }
+    @media (max-width: 1024px) { .tab-pane.active { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.85rem;
+    }
+    .card h2 { font-size: 1rem; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; }
+    .card h3 { font-size: 0.85rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .field-row { display: grid; grid-template-columns: 1fr 110px; gap: 0.5rem; align-items: center; font-size: 0.85rem; }
+    .field-stack { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.85rem; }
+    input[type="number"], input[type="text"], select {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.4rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      width: 100%;
+    }
+    input[type="range"] { width: 100%; accent-color: var(--accent); }
+    .chk-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.85rem; cursor: pointer; }
+    .btn-row { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+    button.btn {
+      background: var(--panel-alt);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 0.48rem 0.75rem;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 0.82rem;
+      font-weight: 600;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    button.btn:hover { border-color: var(--accent); background: rgba(56, 189, 248, 0.15); }
+    button.btn.primary { background: var(--accent-hover); border-color: var(--accent); color: #fff; }
+    button.btn.primary:hover { background: var(--accent); color: #000; }
+    button.btn.success { background: #059669; border-color: var(--success); color: #fff; }
+    button.btn.active-tool { border-color: var(--warn); background: rgba(245, 158, 11, 0.2); color: var(--warn); }
+    .workspace-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 1rem; }
+    .canvas-wrap {
+      background: #090d12;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 460px;
+    }
+    canvas { max-width: 100%; height: auto; display: block; }
+    .status-bar {
+      font-family: monospace;
+      font-size: 0.78rem;
+      color: var(--muted);
+      background: var(--bg);
+      padding: 0.45rem 0.65rem;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+    }
+    .hint { font-size: 0.78rem; color: var(--muted); line-height: 1.4; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span>ToolScan CAD</span>
+    <span class="badge">Offline Client-Side WebApp</span>
+  </div>
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="tab-1">1. Calibration Studio</button>
+    <button class="tab-btn" data-tab="tab-2">2. Capture, Rectify &amp; Segment</button>
+    <button class="tab-btn" data-tab="tab-3">3. Mode 2: Gridfinity Composer</button>
+    <button class="tab-btn" data-tab="tab-4">4. Mode 1: 3D Tool Reconstructor</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ==================== TAB 1: CALIBRATION STUDIO ==================== -->
+  <section id="tab-1" class="tab-pane active">
+    <div class="card">
+      <h2>1. Calibration Target &amp; Overrides</h2>
+      <p class="hint">Print the A4 fiducial target at 100% scale (or place a 50x50x50 mm cube next to your tool). Use the caliper overrides below to eliminate 2D/3D printer scaling tolerances.</p>
+
+      <h3>Caliper Scale Overrides</h3>
+      <div class="field-row">
+        <label for="cal-sheet-w">Measured Fiducial Width (mm)</label>
+        <input type="number" id="cal-sheet-w" value="180.0" step="0.1" />
+      </div>
+      <div class="field-row">
+        <label for="cal-sheet-h">Measured Fiducial Height (mm)</label>
+        <input type="number" id="cal-sheet-h" value="250.0" step="0.1" />
+      </div>
+      <div class="field-row">
+        <label for="cal-cube-size">Measured 50mm Cube Width (mm)</label>
+        <input type="number" id="cal-cube-size" value="50.0" step="0.05" />
+      </div>
+      <div class="field-row">
+        <label for="cal-cam-height">Default Camera Height Z (mm)</label>
+        <input type="number" id="cal-cam-height" value="420.0" step="5" />
+      </div>
+
+      <h3>Download Printable Targets</h3>
+      <div class="btn-row">
+        <button class="btn primary" id="btn-dl-a4-svg">Download A4 Sheet (.SVG)</button>
+        <button class="btn" id="btn-print-a4">Print A4 Target</button>
+      </div>
+      <div class="btn-row">
+        <button class="btn" id="btn-dl-cube-scad">50mm Fiducial Cube (.SCAD)</button>
+        <button class="btn" id="btn-dl-cube-stl">50mm Fiducial Cube (.STL)</button>
+      </div>
+
+      <h3>Zero-Hardware Quick Test</h3>
+      <p class="hint">Generate synthetic perspective-tilted Top + Side photos of a combination wrench (with cast shadows, chrome specular reflection, A4 ArUco sheet, and 50mm cube) and load them into Tab 2.</p>
+      <button class="btn success" id="btn-gen-synth">Generate &amp; Load Synthetic Test Photos</button>
+      <div id="cal-status" class="status-bar">Ready. Calibration set to 180.0 x 250.0 mm fiducial ring.</div>
+    </div>
+
+    <div class="workspace-grid">
+      <div class="card">
+        <h2>Printable A4 ArUco Calibration Sheet Preview (210 × 297 mm)</h2>
+        <div class="canvas-wrap" id="a4-svg-preview-container" style="background:#111822; padding:1rem;"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== TAB 2: CAPTURE, RECTIFY & SEGMENT ==================== -->
+  <section id="tab-2" class="tab-pane">
+    <div class="card">
+      <h2>2. Capture, Rectify &amp; Contour</h2>
+
+      <div class="field-stack">
+        <label>Top-View Photo (on A4 sheet or with 50mm cube)</label>
+        <input type="file" id="file-top-photo" accept="image/*" />
+      </div>
+      <div class="field-stack">
+        <label>Optional Side-Profile Photo (for height profile &amp; Mode 1 Loft)</label>
+        <input type="file" id="file-side-photo" accept="image/*" />
+      </div>
+
+      <h3>Calibration &amp; Parallax Correction</h3>
+      <div class="field-row">
+        <label for="sel-cal-reference">Scale Reference</label>
+        <select id="sel-cal-reference">
+          <option value="both">A4 Sheet + 50mm Cube</option>
+          <option value="sheet">A4 ArUco Sheet Only</option>
+          <option value="cube">50mm Cube Only</option>
+        </select>
+      </div>
+      <div class="field-row">
+        <label for="sel-parallax-mode">Parallax Correction</label>
+        <select id="sel-parallax-mode">
+          <option value="pose">Camera Pose + Tool Z</option>
+          <option value="side">Side-Profile Height Map</option>
+          <option value="none">None (Telephoto / Flat)</option>
+        </select>
+      </div>
+      <div class="field-row">
+        <label for="inp-tool-thickness">Tool Thickness / Height (mm)</label>
+        <input type="number" id="inp-tool-thickness" value="14.0" step="0.5" />
+      </div>
+
+      <h3>Shadow-Safe Segmentation</h3>
+      <div class="field-stack">
+        <label>LAB Shadow Suppression (<span id="lbl-shadow-tol">38</span>)</label>
+        <input type="range" id="inp-shadow-tol" min="0" max="100" value="38" />
+      </div>
+      <div class="field-stack">
+        <label>Foreground Threshold (<span id="lbl-luma-thresh">165</span>)</label>
+        <input type="range" id="inp-luma-thresh" min="40" max="245" value="165" />
+      </div>
+      <div class="field-stack">
+        <label>Polygon Smoothing RDP (<span id="lbl-rdp-eps">0.6</span> mm)</label>
+        <input type="range" id="inp-rdp-eps" min="0.1" max="3.0" step="0.1" value="0.6" />
+      </div>
+      <div class="btn-row">
+        <button class="btn primary" id="btn-auto-segment">Re-Run CV Pipeline</button>
+        <button class="btn" id="btn-webgpu-ai" title="Runs local on-device AI segmentation if WebGPU is available">Local WebGPU Enhance</button>
+      </div>
+
+      <h3>Interactive Canvas Editor (3.3c)</h3>
+      <div class="btn-row">
+        <button class="btn active-tool" id="btn-edit-mode-poly">Drag/Click Vertices</button>
+        <button class="btn" id="btn-edit-mode-brush">Paint Mask (+)</button>
+        <button class="btn" id="btn-edit-mode-erase">Erase Mask (-)</button>
+        <button class="btn" id="btn-edit-mode-bridge">Bridge Pliers Gap</button>
+      </div>
+      <label class="chk-row">
+        <input type="checkbox" id="chk-outer-only" checked />
+        <span>Extract Outer Perimeter Only (ignore internal holes)</span>
+      </label>
+
+      <h3>Send Extracted Tool To:</h3>
+      <div class="field-row">
+        <label for="inp-tool-name">Tool Label</label>
+        <input type="text" id="inp-tool-name" value="Combo Wrench 13mm" />
+      </div>
+      <div class="btn-row">
+        <button class="btn success" id="btn-send-to-gridfinity">Add to Gridfinity (Mode 2)</button>
+        <button class="btn primary" id="btn-send-to-mode1">Send to 3D Reconstructor (Mode 1)</button>
+      </div>
+      <div id="cv-status" class="status-bar">Waiting for photo upload or synthetic test image...</div>
+    </div>
+
+    <div class="workspace-grid">
+      <div class="card">
+        <h2>Rectified Top View &amp; Interactive Polygon Editor (1:1 Metric Space)</h2>
+        <p class="hint">Drag cyan vertices to refine contour. Shift+Click a vertex to delete it; click any segment midpoint to insert a vertex.</p>
+        <div class="canvas-wrap">
+          <canvas id="cv-canvas" width="720" height="960"></canvas>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Side-Profile Depth &amp; Height Map</h2>
+        <p class="hint">Used for variable parallax correction and Mode 1 two-view orthographic 3D lofting.</p>
+        <div class="canvas-wrap">
+          <canvas id="side-canvas" width="720" height="320"></canvas>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== TAB 3: MODE 2 GRIDFINITY COMPOSER ==================== -->
+  <section id="tab-3" class="tab-pane">
+    <div class="card">
+      <h2>3. Mode 2: Gridfinity &amp; Negative</h2>
+
+      <h3>Gridfinity Base Parameters</h3>
+      <div class="field-row">
+        <label for="gf-pitch">Grid Pitch XY (mm)</label>
+        <input type="number" id="gf-pitch" value="42.0" step="0.5" />
+      </div>
+      <div class="field-row">
+        <label for="gf-u-height">Height Unit U (mm)</label>
+        <input type="number" id="gf-u-height" value="7.0" step="0.5" />
+      </div>
+      <div class="field-row">
+        <label for="gf-grid-x">Grid Columns (X units)</label>
+        <input type="number" id="gf-grid-x" value="2" min="1" max="10" />
+      </div>
+      <div class="field-row">
+        <label for="gf-grid-y">Grid Rows (Y units)</label>
+        <input type="number" id="gf-grid-y" value="5" min="1" max="10" />
+      </div>
+      <div class="field-row">
+        <label for="gf-grid-u">Bin Height (U units)</label>
+        <input type="number" id="gf-grid-u" value="4" min="2" max="20" />
+      </div>
+      <div class="btn-row">
+        <button class="btn" id="btn-gf-autofit">Auto-Fit Grid to Tools</button>
+        <button class="btn" id="btn-gf-rotate-45">Rotate Active Tool 45°</button>
+      </div>
+
+      <h3>Pocket &amp; Finger-Lift Cutouts</h3>
+      <div class="field-row">
+        <label for="gf-clearance">Radial XY Clearance (mm)</label>
+        <input type="number" id="gf-clearance" value="1.5" step="0.1" />
+      </div>
+      <div class="field-row">
+        <label for="gf-pocket-depth">Pocket Cut Depth (mm)</label>
+        <input type="number" id="gf-pocket-depth" value="14.0" step="0.5" />
+      </div>
+      <div class="field-row">
+        <label for="gf-chamfer">Top Entry Chamfer (mm)</label>
+        <input type="number" id="gf-chamfer" value="1.2" step="0.2" />
+      </div>
+      <div class="field-row">
+        <label for="gf-scoop-radius">Finger Scoop Radius (mm)</label>
+        <input type="number" id="gf-scoop-radius" value="11.0" step="0.5" />
+      </div>
+      <div class="btn-row">
+        <button class="btn" id="btn-gf-add-scoop">+ Add Finger Scoop</button>
+        <button class="btn" id="btn-gf-clear-tools">Clear All Tools</button>
+      </div>
+      
+      <h3>Retention Clips &amp; Contoured Floor</h3>
+      <label class="chk-row">
+        <input type="checkbox" id="gf-use-floor-support" checked />
+        <span>Raised Under-Support Floor (from Side Photo)</span>
+      </label>
+      <div class="field-row">
+        <label for="gf-snap-overhang">Snap-Lip Overhang (mm)</label>
+        <input type="number" id="gf-snap-overhang" value="0.7" step="0.1" min="0.2" max="2.0" />
+      </div>
+      <label class="chk-row">
+        <input type="checkbox" id="gf-snap-relief" checked />
+        <span>Flex Relief Slots Behind Snap Clips</span>
+      </label>
+      <div class="btn-row">
+        <button class="btn" id="btn-gf-add-snap">+ Add Snap-Fit Clip</button>
+      </div>
+
+      <h3>Baseplate &amp; Lip Options</h3>
+      <label class="chk-row"><input type="checkbox" id="gf-lip" checked /><span>Include Stacking Lip (4.4 mm)</span></label>
+      <label class="chk-row"><input type="checkbox" id="gf-magnets" checked /><span>Magnet Holes (6.5 × 2.4 mm)</span></label>
+      <label class="chk-row"><input type="checkbox" id="gf-crush-ribs" checked /><span>Magnet Press-Fit Crush Ribs</span></label>
+      <label class="chk-row"><input type="checkbox" id="gf-bridgeless" checked /><span>Bridgeless Magnet Top (2-stage step)</span></label>
+      <label class="chk-row"><input type="checkbox" id="gf-screws" /><span>M3 Counterbored Screw Holes</span></label>
+      <label class="chk-row"><input type="checkbox" id="gf-flat-base" /><span>Flat Bottom (Drawer Insert Mode)</span></label>
+
+      <h3>CAD &amp; Vector Exports</h3>
+      <div class="btn-row">
+        <button class="btn primary" id="btn-exp-scad">Export .SCAD</button>
+        <button class="btn success" id="btn-exp-bin-stl">Export Bin .STL</button>
+        <button class="btn warn" id="btn-exp-neg-stl">Export Tool Negative .STL</button>
+      </div>
+      <div class="btn-row">
+        <button class="btn" id="btn-exp-3mf">Export .3MF</button>
+        <button class="btn" id="btn-exp-step">Export .STEP (AP214)</button>
+        <button class="btn" id="btn-exp-svg">Export 1:1 .SVG</button>
+        <button class="btn" id="btn-exp-dxf">Export 1:1 .DXF</button>
+      </div>
+      <div id="gf-status" class="status-bar">Drag tools or orange finger scoops on the 2D grid.</div>
+    </div>
+
+    <div class="workspace-grid">
+      <div class="card">
+        <h2>Interactive 2D Gridfinity Layout &amp; Finger-Scoop Editor</h2>
+        <p class="hint">Drag tool outlines to position. Drag orange circles along the perimeter to reposition finger-lift scoops. Use mouse wheel or slider to rotate.</p>
+        <div class="canvas-wrap">
+          <canvas id="gf-2d-canvas" width="600" height="720"></canvas>
+        </div>
+      </div>
+      <div class="card">
+        <h2>3D Parametric Bin &amp; Negative Volume Preview</h2>
+        <div class="btn-row">
+          <button class="btn primary" id="btn-gf-rebuild-3d">Update 3D Mesh</button>
+          <button class="btn" id="btn-gf-toggle-neg">Toggle Negative Volume Ghost</button>
+        </div>
+        <div class="canvas-wrap" id="gf-3d-viewport" style="height: 640px;"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== TAB 4: MODE 1 3D TOOL RECONSTRUCTOR ==================== -->
+  <section id="tab-4" class="tab-pane">
+    <div class="card">
+      <h2>4. Mode 1: 3D Tool Reconstructor</h2>
+      <p class="hint">Reconstructs a watertight manifold 3D mesh of the tool itself for boolean operations in Blender/OpenSCAD or custom vertical mounts.</p>
+
+      <div class="field-row">
+        <label for="m1-method">Reconstruction Engine</label>
+        <select id="m1-method">
+          <option value="loft">2-View Orthographic Loft (Top + Side)</option>
+          <option value="carve">Multi-View Visual Hull Space Carving</option>
+        </select>
+      </div>
+      <div class="field-row">
+        <label for="m1-profile-shape">Cross-Section Blending</label>
+        <select id="m1-profile-shape">
+          <option value="elliptical">Super-Elliptical (Ergonomic Handle/Shaft)</option>
+          <option value="rounded">Filleted Rectangular (Box/Hex Tools)</option>
+          <option value="visualhull">Strict Silhouette Intersection</option>
+        </select>
+      </div>
+      <div class="field-row">
+        <label for="m1-voxel-res">Axial / Voxel Resolution</label>
+        <input type="number" id="m1-voxel-res" value="96" min="32" max="200" step="8" />
+      </div>
+      <div class="field-row">
+        <label for="m1-smooth-iter">Taubin Manifold Smoothing</label>
+        <input type="number" id="m1-smooth-iter" value="6" min="0" max="20" />
+      </div>
+      <div class="field-row">
+        <label for="m1-boolean-offset">3D Boolean Clearance (mm)</label>
+        <input type="number" id="m1-boolean-offset" value="0.0" step="0.2" />
+      </div>
+
+      <div class="field-stack">
+        <label>Optional Additional Turntable Views (for Multi-View Carving)</label>
+        <input type="file" id="file-multi-photos" accept="image/*" multiple />
+      </div>
+
+      <button class="btn primary" id="btn-m1-reconstruct">Reconstruct Watertight 3D Tool Mesh</button>
+
+      <h3>Export 3D Tool Model</h3>
+      <div class="btn-row">
+        <button class="btn success" id="btn-m1-exp-stl">Export Manifold .STL</button>
+        <button class="btn primary" id="btn-m1-exp-3mf">Export .3MF</button>
+        <button class="btn" id="btn-m1-exp-scad">Export Polyhedron .SCAD</button>
+      </div>
+      <div id="m1-status" class="status-bar">Ready to reconstruct 3D tool mesh.</div>
+    </div>
+
+    <div class="workspace-grid">
+      <div class="card">
+        <h2>Interactive 3D Tool Mesh Inspector (Watertight Manifold)</h2>
+        <div class="canvas-wrap" id="m1-3d-viewport" style="height: 680px;"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+  // ==================== GLOBAL SHARED STATE ====================
+  window.AppState = {
+    calibration: {
+      sheetW: 180.0,
+      sheetH: 250.0,
+      cubeSize: 50.0,
+      camHeight: 420.0,
+      pxPerMm: 3.2
+    },
+    activeToolContourMm: [], // [{x, y}] in mm centered at (0,0)
+    activeHeightProfile: [], // [{t: 0..1, zBottom: mm, zTop: mm}]
+    placedTools: [],         // [{id, name, contourMm, heightProfile, xMm, yMm, rotDeg, clearance, depth, thickness, scoops:[{x,y,r}]}]
+    activeToolIndex: 0,
+    mode1Mesh: { vertices: [], faces: [] },
+    downloadBlob(content, filename, mime = 'application/octet-stream') {
+      const blob = content instanceof Blob ? content : new Blob([content], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+    }
+  };
+
+  // ==================== TAB NAVIGATION ====================
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      const pane = document.getElementById(btn.dataset.tab);
+      if (pane) pane.classList.add('active');
+      window.dispatchEvent(new CustomEvent('tab-changed', { detail: btn.dataset.tab }));
+    });
+  });
+
+  // ==================== PROCEDURAL 4x4 ARUCO MARKER GENERATOR ====================
+  // Deterministic 16-bit codes for markers ID 0..7 with Hamming distance
+  const ARUCO_CODES_4X4 = [
+    0b1010010111000110, 0b0110110010011010, 0b1100001101101001, 0b0011101011010100,
+    0b1001111000101101, 0b0101000111110011, 0b1111010001001110, 0b0000111110110001
+  ];
+
+  function renderArucoSvgGroup(id, xMm, yMm, sizeMm) {
+    const code = ARUCO_CODES_4X4[id % ARUCO_CODES_4X4.length];
+    const cell = sizeMm / 6;
+    let rects = `<rect x="${xMm}" y="${yMm}" width="${sizeMm}" height="${sizeMm}" fill="#000"/>`;
+    for (let r = 0; r < 4; r++) {
+      for (let c = 0; c < 4; c++) {
+        const bit = (code >> (15 - (r * 4 + c))) & 1;
+        if (bit) {
+          rects += `<rect x="${(xMm + (c + 1) * cell).toFixed(2)}" y="${(yMm + (r + 1) * cell).toFixed(2)}" width="${cell.toFixed(2)}" height="${cell.toFixed(2)}" fill="#fff"/>`;
+        }
+      }
+    }
+    return `<g data-aruco-id="${id}">${rects}</g>`;
+  }
+
+  function buildA4CalibrationSvg() {
+    const fw = parseFloat(document.getElementById('cal-sheet-w').value) || 180;
+    const fh = parseFloat(document.getElementById('cal-sheet-h').value) || 250;
+    window.AppState.calibration.sheetW = fw;
+    window.AppState.calibration.sheetH = fh;
+    window.AppState.calibration.cubeSize = parseFloat(document.getElementById('cal-cube-size').value) || 50;
+    window.AppState.calibration.camHeight = parseFloat(document.getElementById('cal-cam-height').value) || 420;
+
+    const cx = 105, cy = 148.5;
+    const x0 = cx - fw / 2, y0 = cy - fh / 2;
+    const x1 = cx + fw / 2, y1 = cy + fh / 2;
+    const mSize = 18; // 18mm ArUco markers centered at corners
+
+    let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="297mm" viewBox="0 0 210 297">
+      <rect width="210" height="297" fill="#ffffff"/>
+      <rect x="${x0}" y="${y0}" width="${fw}" height="${fh}" fill="none" stroke="#cbd5e1" stroke-width="0.4" stroke-dasharray="3,3"/>
+      <!-- Scale verification bars -->
+      <line x1="${x0 + 15}" y1="${y0 - 4}" x2="${x1 - 15}" y2="${y0 - 4}" stroke="#000" stroke-width="0.6"/>
+      <text x="${cx}" y="${y0 - 6}" font-family="monospace" font-size="3.2" text-anchor="middle" fill="#000">FIDUCIAL RING: ${fw.toFixed(1)} mm × ${fh.toFixed(1)} mm (PRINT AT 100% SCALE)</text>
+      <!-- 4 Corner ArUco Markers (IDs 0,1,2,3) centered on (x0,y0)..(x0,y1) -->
+      ${renderArucoSvgGroup(0, x0 - mSize / 2, y0 - mSize / 2, mSize)}
+      ${renderArucoSvgGroup(1, x1 - mSize / 2, y0 - mSize / 2, mSize)}
+      ${renderArucoSvgGroup(2, x1 - mSize / 2, y1 - mSize / 2, mSize)}
+      ${renderArucoSvgGroup(3, x0 - mSize / 2, y1 - mSize / 2, mSize)}
+      <!-- 50x50mm Calibration Cube Parking Zone -->
+      <rect x="${x1 - 62}" y="${y0 + 12}" width="50" height="50" fill="none" stroke="#64748b" stroke-width="0.4" stroke-dasharray="2,2"/>
+      <text x="${x1 - 37}" y="${y0 + 38}" font-family="monospace" font-size="3" text-anchor="middle" fill="#64748b">50x50mm CUBE ZONE</text>
+      <!-- Center crosshair -->
+      <path d="M ${cx - 5} ${cy} L ${cx + 5} ${cy} M ${cx} ${cy - 5} L ${cx} ${cy + 5}" stroke="#94a3b8" stroke-width="0.3"/>
+    </svg>`;
+    document.getElementById('a4-svg-preview-container').innerHTML = svg;
+    document.getElementById('cal-status').textContent =
+      `Calibration active: ${fw.toFixed(1)}×${fh.toFixed(1)} mm sheet, ${window.AppState.calibration.cubeSize.toFixed(2)} mm cube, Cam Z=${window.AppState.calibration.camHeight} mm.`;
+    return svg;
+  }
+
+  ['cal-sheet-w', 'cal-sheet-h', 'cal-cube-size', 'cal-cam-height'].forEach(id => {
+    document.getElementById(id).addEventListener('input', buildA4CalibrationSvg);
+  });
+  buildA4CalibrationSvg();
+
+  document.getElementById('btn-dl-a4-svg').addEventListener('click', () => {
+    window.AppState.downloadBlob(buildA4CalibrationSvg(), 'ToolScan_A4_Calibration_Sheet.svg', 'image/svg+xml');
+  });
+
+  document.getElementById('btn-print-a4').addEventListener('click', () => {
+    const w = window.open('', '_blank');
+    w.document.write(`<html><head><title>Print A4 Calibration Target</title><style>@page{size:A4;margin:0;}body{margin:0;}</style></head><body>${buildA4CalibrationSvg()}</body></html>`);
+    w.document.close();
+    setTimeout(() => w.print(), 300);
+  });
+
+  // ==================== 50mm CALIBRATION CUBE (.SCAD & .STL) ====================
+  document.getElementById('btn-dl-cube-scad').addEventListener('click', () => {
+    const s = window.AppState.calibration.cubeSize;
+    const scad = `// ToolScan CAD — ${s}x${s}x${s}mm Fiducial Calibration Cube\ncube_size = ${s.toFixed(2)};\ndifference() {\n  cube([cube_size, cube_size, cube_size], center=true);\n  // Top fiducial framing step (1.2mm deep)\n  translate([0, 0, cube_size/2 - 0.6]) difference() {\n    cube([cube_size*0.76, cube_size*0.76, 1.5], center=true);\n    cube([cube_size*0.48, cube_size*0.48, 2.0], center=true);\n  }\n  // X/Y orientation notches\n  translate([0, -cube_size/2, 0]) cube([cube_size*0.4, 2.0, 2.0], center=true);\n}\n`;
+    window.AppState.downloadBlob(scad, `Calibration_Cube_${s}mm.scad`, 'text/plain');
+  });
+
+  document.getElementById('btn-dl-cube-stl').addEventListener('click', () => {
+    const h = window.AppState.calibration.cubeSize / 2;
+    const v = [
+      [-h,-h,-h],[h,-h,-h],[h,h,-h],[-h,h,-h],
+      [-h,-h, h],[h,-h, h],[h,h, h],[-h,h, h]
+    ];
+    const quads = [[0,3,2,1],[4,5,6,7],[0,1,5,4],[2,3,7,6],[1,2,6,5],[3,0,4,7]];
+    let stl = `solid cal_cube_${h*2}mm\n`;
+    quads.forEach(([a,b,c,d]) => {
+      stl += `facet normal 0 0 0\nouter loop\nvertex ${v[a].join(' ')}\nvertex ${v[b].join(' ')}\nvertex ${v[c].join(' ')}\nendloop\nendfacet\n`;
+      stl += `facet normal 0 0 0\nouter loop\nvertex ${v[a].join(' ')}\nvertex ${v[c].join(' ')}\nvertex ${v[d].join(' ')}\nendloop\nendfacet\n`;
+    });
+    stl += `endsolid cal_cube_${h*2}mm\n`;
+    window.AppState.downloadBlob(stl, `Calibration_Cube_${h*2}mm.stl`, 'application/sla');
+  });
+
+  // ==================== SYNTHETIC TEST PHOTO GENERATOR ====================
+  document.getElementById('btn-gen-synth').addEventListener('click', () => {
+    // Switch to Tab 2 and trigger synthetic image generation in CVEngine
+    document.querySelector('[data-tab="tab-2"]').click();
+    if (window.CVEngine && typeof window.CVEngine.loadSyntheticTestSet === 'function') {
+      window.CVEngine.loadSyntheticTestSet();
+    } else {
+      document.getElementById('cv-status').textContent =
+        'Synthetic test trigger queued — add cv-engine.js (Part 2) to run the vision pipeline.';
+    }
+  });
+</script>
+<script src="cv-engine.js"></script>
+<script src="cad-3d-engine.js"></script>
+</body>
+</html>
