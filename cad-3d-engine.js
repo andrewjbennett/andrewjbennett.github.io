@@ -1,4 +1,4 @@
-// ==================== COMPLETE UPDATED CAD & 3D ENGINE (cad-3d-engine.js) ====================
+// ==================== COMPLETE REBUILT CAD & 3D ENGINE (cad-3d-engine.js) ====================
 (function () {
   const gfCanvas = document.getElementById('gf-2d-canvas');
   const gfCtx = gfCanvas.getContext('2d');
@@ -7,39 +7,14 @@
 
   let showNegativeGhost = false;
   let dragState = null; // { type: 'tool'|'scoop'|'snap', toolIdx, itemIdx, startX, startY, origX, origY }
-  let mode2Meshes = { bin: { vertices: [], faces: [] }, neg: { vertices: [], faces: [] } };
+  let mode2Meshes = {
+    bin: { vertices: [], faces: [] },
+    saddle: { vertices: [], faces: [] },
+    neg: { vertices: [], faces: [] },
+    snaps: { vertices: [], faces: [] }
+  };
 
-  // Auto-inject Snap-Fit & Under-Support UI controls into Tab 3 if not already present in index.html
-  (function ensureSnapAndSupportUI() {
-    if (document.getElementById('gf-use-floor-support')) return;
-    const clearBtn = document.getElementById('btn-gf-clear-tools');
-    if (!clearBtn || !clearBtn.parentElement) return;
-    const wrapper = document.createElement('div');
-    wrapper.style.display = 'flex';
-    wrapper.style.flexDirection = 'column';
-    wrapper.style.gap = '0.6rem';
-    wrapper.innerHTML = `
-      <h3>Retention Clips &amp; Under-Support</h3>
-      <label class="chk-row">
-        <input type="checkbox" id="gf-use-floor-support" checked />
-        <span>Raised Under-Support Floor (Green Profile)</span>
-      </label>
-      <div class="field-row">
-        <label for="gf-snap-overhang">Snap-Lip Overhang (mm)</label>
-        <input type="number" id="gf-snap-overhang" value="0.7" step="0.1" min="0.2" max="2.0" />
-      </div>
-      <label class="chk-row">
-        <input type="checkbox" id="gf-snap-relief" checked />
-        <span>Flex Relief Slots Behind Snap Clips</span>
-      </label>
-      <div class="btn-row">
-        <button class="btn" id="btn-gf-add-snap">+ Add Snap-Fit Clip</button>
-      </div>
-    `;
-    clearBtn.parentElement.insertAdjacentElement('afterend', wrapper);
-  })();
-
-  // ==================== 1. 2D GEOMETRY & RADIAL CLEARANCE HELPERS ====================
+  // ==================== 1. 2D GEOMETRY & RASTER UNION CONTOUR ENGINE ====================
   function transformPt(pt, tx, ty, rotDeg) {
     const r = (rotDeg * Math.PI) / 180;
     const c = Math.cos(r), s = Math.sin(r);
@@ -60,6 +35,153 @@
       a += p0.x * p1.y - p1.x * p0.y;
     }
     return a * 0.5;
+  }
+
+  function pointInPolygon(px, py, pts) {
+    let inside = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const xi = pts[i].x, yi = pts[i].y, xj = pts[j].x, yj = pts[j].y;
+      if (((yi > py) !== (yj > py)) && (px < ((xj - xi) * (py - yi)) / (yj - yi + 1e-12) + xi)) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+
+  function pointLineDist(p, a, b) {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const lenSq = dx * dx + dy * dy;
+    if (lenSq < 1e-6) return Math.hypot(p.x - a.x, p.y - a.y);
+    const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq));
+    return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+  }
+
+  function rdpSimplify(pts, eps) {
+    if (pts.length < 4) return pts;
+    let maxDist = 0, idx = 0;
+    const first = pts[0], last = pts[pts.length - 1];
+    for (let i = 1; i < pts.length - 1; i++) {
+      const d = pointLineDist(pts[i], first, last);
+      if (d > maxDist) { maxDist = d; idx = i; }
+    }
+    if (maxDist > eps) {
+      const left = rdpSimplify(pts.slice(0, idx + 1), eps);
+      const right = rdpSimplify(pts.slice(idx), eps);
+      return left.slice(0, -1).concat(right);
+    }
+    return [first, last];
+  }
+
+  function chaikinSmooth(pts, iterations) {
+    let curr = pts;
+    for (let it = 0; it < iterations; it++) {
+      const next = [];
+      for (let i = 0; i < curr.length; i++) {
+        const p0 = curr[i], p1 = curr[(i + 1) % curr.length];
+        next.push({ x: 0.75 * p0.x + 0.25 * p1.x, y: 0.75 * p0.y + 0.25 * p1.y });
+        next.push({ x: 0.25 * p0.x + 0.75 * p1.x, y: 0.25 * p0.y + 0.75 * p1.y });
+      }
+      curr = next;
+    }
+    return curr;
+  }
+
+  // True rounded offset & boolean union of Tool Polygon + Finger Scoops via high-res 2D Canvas SDF rasterization.
+  // Eliminates all self-intersecting miter spikes and never drops a finger scoop!
+  function buildUnifiedPocketContour(worldToolPts, worldScoops, clearanceMm, binW, binH) {
+    if (!worldToolPts || worldToolPts.length < 3) return [];
+    const scale = 3.0; // 3 pixels per mm
+    const marginMm = 4.0;
+    const cw = Math.ceil((binW + marginMm * 2) * scale);
+    const ch = Math.ceil((binH + marginMm * 2) * scale);
+    const ox = cw / 2, oy = ch / 2;
+
+    const can = document.createElement('canvas');
+    can.width = cw; can.height = ch;
+    const ctx = can.getContext('2d');
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, cw, ch);
+
+    ctx.fillStyle = '#fff';
+    ctx.strokeStyle = '#fff';
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.lineWidth = Math.max(0.5, clearanceMm * 2 * scale);
+
+    // 1. Draw rounded-offset tool polygon
+    ctx.beginPath();
+    worldToolPts.forEach((p, i) => {
+      const px = ox + p.x * scale, py = oy + p.y * scale;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    });
+    ctx.closePath();
+    ctx.fill();
+    if (clearanceMm > 0.05) ctx.stroke();
+
+    // 2. Boolean-union circular finger scoops
+    (worldScoops || []).forEach(sc => {
+      ctx.beginPath();
+      ctx.arc(ox + sc.x * scale, oy + sc.y * scale, sc.r * scale, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    // 3. Clamp to inside the bin walls (leave 1.5mm perimeter rim so top face stays intact)
+    const rimPx = Math.ceil((marginMm + 1.5) * scale);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, cw, rimPx);
+    ctx.fillRect(0, ch - rimPx, cw, rimPx);
+    ctx.fillRect(0, 0, rimPx, ch);
+    ctx.fillRect(cw - rimPx, 0, rimPx, ch);
+
+    // 4. Trace outer boundary with Moore-Neighbor contour walk
+    const imgData = ctx.getImageData(0, 0, cw, ch).data;
+    const mask = new Uint8Array(cw * ch);
+    for (let i = 0; i < cw * ch; i++) {
+      if (imgData[i * 4] > 127) mask[i] = 1;
+    }
+
+    let startX = -1, startY = -1;
+    outer: for (let y = 1; y < ch - 1; y++) {
+      for (let x = 1; x < cw - 1; x++) {
+        if (mask[y * cw + x]) { startX = x; startY = y; break outer; }
+      }
+    }
+    if (startX === -1) return [];
+
+    const dirs = [[-1, 0], [-1, -1], [0, -1], [1, -1], [1, 0], [1, 1], [0, 1], [-1, 1]];
+    const rawPts = [];
+    let cx = startX, cy = startY, backtrackDir = 0;
+    let maxSteps = 12000;
+    while (maxSteps-- > 0) {
+      rawPts.push({ x: (cx - ox) / scale, y: (cy - oy) / scale });
+      let found = false;
+      for (let k = 0; k < 8; k++) {
+        const dIdx = (backtrackDir + k) % 8;
+        const nx = cx + dirs[dIdx][0], ny = cy + dirs[dIdx][1];
+        if (nx >= 0 && nx < cw && ny >= 0 && ny < ch && mask[ny * cw + nx]) {
+          cx = nx; cy = ny;
+          backtrackDir = (dIdx + 5) % 8;
+          found = true;
+          break;
+        }
+      }
+      if (!found || (cx === startX && cy === startY && rawPts.length > 15)) break;
+    }
+
+    const simplified = rdpSimplify(rawPts, 0.35);
+    const smoothed = chaikinSmooth(simplified, 1);
+
+    // Deduplicate vertices closer than 0.4mm so Earcut never sees degenerate zero-length edges
+    const clean = [];
+    for (let p of smoothed) {
+      if (!clean.length || Math.hypot(p.x - clean[clean.length - 1].x, p.y - clean[clean.length - 1].y) > 0.4) {
+        clean.push(p);
+      }
+    }
+    if (clean.length > 2 && Math.hypot(clean[0].x - clean[clean.length - 1].x, clean[0].y - clean[clean.length - 1].y) <= 0.4) {
+      clean.pop();
+    }
+    return clean;
   }
 
   function offsetPolygon(pts, offsetMm) {
@@ -83,32 +205,10 @@
       const bl = Math.hypot(bx, by);
       if (bl < 1e-4) { bx = n1x; by = n1y; } else { bx /= bl; by /= bl; }
       const dot = bx * n1x + by * n1y;
-      // Clamp miter strictly to 1.35 to prevent concave spikes/bowties on sharp bends
       const miter = Math.min(1.35, 1 / Math.max(0.55, dot));
       raw.push({ x: pCurr.x + bx * offsetMm * miter, y: pCurr.y + by * offsetMm * miter });
     }
-
-    // Prune micro-backtracks / self-intersecting ear loops caused by concave inward corners
-    const cleaned = [];
-    const minStep = 0.6;
-    for (let i = 0; i < raw.length; i++) {
-      const p = raw[i];
-      if (!cleaned.length || Math.hypot(p.x - cleaned[cleaned.length - 1].x, p.y - cleaned[cleaned.length - 1].y) >= minStep) {
-        cleaned.push(p);
-      }
-    }
-    return cleaned.length >= 3 ? cleaned : raw;
-  }
-
-  function pointInPolygon(px, py, pts) {
-    let inside = false;
-    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
-      const xi = pts[i].x, yi = pts[i].y, xj = pts[j].x, yj = pts[j].y;
-      if (((yi > py) !== (yj > py)) && (px < ((xj - xi) * (py - yi)) / (yj - yi + 1e-12) + xi)) {
-        inside = !inside;
-      }
-    }
-    return inside;
+    return raw;
   }
 
   function getGfParams() {
@@ -170,7 +270,6 @@
     gfCtx.fill();
     gfCtx.stroke();
 
-    // Draw 42mm unit grid lines & magnet locations
     gfCtx.strokeStyle = '#1e293b';
     gfCtx.lineWidth = 1;
     for (let ix = 0; ix < p.gx; ix++) {
@@ -193,14 +292,14 @@
       }
     }
 
-    // Draw each placed tool, green under-support zone, orange finger scoops, purple snap clips & [x] badges
     window.AppState.placedTools.forEach((tool, idx) => {
       const isSelected = idx === window.AppState.activeToolIndex;
       const worldRaw = tool.contourMm.map(pt => transformPt(pt, tool.xMm, tool.yMm, tool.rotDeg));
       const localOffset = offsetPolygon(tool.contourMm, p.clearance);
-      const worldOffset = localOffset.map(pt => transformPt(pt, tool.xMm, tool.yMm, tool.rotDeg));
+      const worldOffset = localOffset.map(pt => transformPt(pt, tX(tool), tY(tool), tool.rotDeg));
+      function tX(t) { return t.xMm; }
+      function tY(t) { return t.yMm; }
 
-      // Clearance pocket outline (dashed cyan)
       if (worldOffset.length > 2) {
         gfCtx.fillStyle = isSelected ? 'rgba(56, 189, 248, 0.18)' : 'rgba(56, 189, 248, 0.09)';
         gfCtx.strokeStyle = isSelected ? '#38bdf8' : '#0284c7';
@@ -217,7 +316,6 @@
         gfCtx.setLineDash([]);
       }
 
-      // True tool silhouette
       if (worldRaw.length > 2) {
         gfCtx.fillStyle = 'rgba(15, 23, 42, 0.78)';
         gfCtx.strokeStyle = '#10b981';
@@ -232,7 +330,6 @@
         gfCtx.stroke();
       }
 
-      // Finger-lift scoops (orange circles) + small [x] delete badge
       (tool.scoops || []).forEach(sc => {
         sc.r = p.scoopR;
         const wSc = transformPt(sc, tool.xMm, tool.yMm, tool.rotDeg);
@@ -259,7 +356,6 @@
         }
       });
 
-      // Snap-fit retention clips (purple nodes) + small [x] delete badge
       (tool.snaps || []).forEach(sn => {
         const wSn = transformPt(sn, tool.xMm, tool.yMm, tool.rotDeg);
         const sx = cx + wSn.x * scale, sy = cy + wSn.y * scale;
@@ -289,14 +385,12 @@
         }
       });
 
-      // Tool centroid label
       gfCtx.fillStyle = '#e2e8f0';
       gfCtx.font = '600 11px monospace';
       gfCtx.textAlign = 'center';
       gfCtx.textBaseline = 'alphabetic';
       gfCtx.fillText(`${tool.name} (${tool.rotDeg.toFixed(0)}°)`, cx + tool.xMm * scale, cy + tool.yMm * scale);
 
-      // Red [×] Delete Tool badge in top-right corner of the tool's bounding box
       if (worldRaw.length > 2) {
         const delMm = getToolDeleteBtnMm(tool);
         const dxPx = cx + delMm.x * scale;
@@ -330,7 +424,6 @@
     const { xMm, yMm, px, py, scale, cx, cy } = canvasEventToMm(e);
     const tools = window.AppState.placedTools;
 
-    // 1. Check Tool [×] delete button
     for (let tIdx = tools.length - 1; tIdx >= 0; tIdx--) {
       const t = tools[tIdx];
       if (t.contourMm.length > 2) {
@@ -345,7 +438,6 @@
       }
     }
 
-    // 2. Check Snap-Fit Clip [×] delete badge or drag handle
     for (let tIdx = tools.length - 1; tIdx >= 0; tIdx--) {
       const t = tools[tIdx];
       for (let sIdx = (t.snaps || []).length - 1; sIdx >= 0; sIdx--) {
@@ -369,7 +461,6 @@
       }
     }
 
-    // 3. Check Finger Scoop [×] delete badge or drag handle
     for (let tIdx = tools.length - 1; tIdx >= 0; tIdx--) {
       const t = tools[tIdx];
       for (let sIdx = (t.scoops || []).length - 1; sIdx >= 0; sIdx--) {
@@ -394,7 +485,6 @@
       }
     }
 
-    // 4. Check tool body hit to select/drag tool
     for (let tIdx = tools.length - 1; tIdx >= 0; tIdx--) {
       const t = tools[tIdx];
       const worldPts = t.contourMm.map(pt => transformPt(pt, t.xMm, t.yMm, t.rotDeg));
@@ -442,7 +532,6 @@
     renderGf2D();
   }, { passive: false });
 
-  // Delete or Backspace removes active tool
   window.addEventListener('keydown', e => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
     if ((e.key === 'Delete' || e.key === 'Backspace') &&
@@ -467,12 +556,12 @@
     container.innerHTML = '';
     container.appendChild(renderer.domElement);
 
-    const hemi = new THREE.HemisphereLight(0xffffff, 0x334155, 0.85);
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x334155, 0.9);
     scene.add(hemi);
     const dir1 = new THREE.DirectionalLight(0xffffff, 0.75);
     dir1.position.set(120, -140, 220);
     scene.add(dir1);
-    const dir2 = new THREE.DirectionalLight(0x38bdf8, 0.35);
+    const dir2 = new THREE.DirectionalLight(0x38bdf8, 0.4);
     dir2.position.set(-140, 120, 100);
     scene.add(dir2);
 
@@ -537,7 +626,6 @@
     const pos = new Float32Array(mesh.faces.length * 9);
     let k = 0;
     for (let f of mesh.faces) {
-      // Negating Y (-v[1]) reflects space and inverts winding; swap v1 and v2 so normals face OUTWARD
       const v0 = mesh.vertices[f[0]], v1 = mesh.vertices[f[2]], v2 = mesh.vertices[f[1]];
       pos[k++] = v0[0]; pos[k++] = -v0[1]; pos[k++] = v0[2];
       pos[k++] = v1[0]; pos[k++] = -v1[1]; pos[k++] = v1[2];
@@ -548,7 +636,7 @@
     return geom;
   }
 
-  // ==================== 4. MODE 2: EXACT VECTOR CSG, CONTOURED FLOOR & SNAP CLIPS ====================
+  // ==================== 4. MODE 2: CLEAN RASTER-CONTOUR CSG + EXPLICIT SLOPED SADDLE ====================
   function makeRoundedRectPts(w, h, r, segsPerCorner = 8) {
     const pts = [];
     const rx = Math.min(r, w / 2 - 0.1), ry = Math.min(r, h / 2 - 0.1);
@@ -567,89 +655,6 @@
     return pts;
   }
 
-  function densifyPolygon(pts, maxSegLen = 1.5) {
-    const out = [];
-    for (let i = 0; i < pts.length; i++) {
-      const a = pts[i], b = pts[(i + 1) % pts.length];
-      const d = Math.hypot(b.x - a.x, b.y - a.y);
-      const steps = Math.max(1, Math.ceil(d / maxSegLen));
-      for (let s = 0; s < steps; s++) {
-        const t = s / steps;
-        out.push({ x: a.x + t * (b.x - a.x), y: a.y + t * (b.y - a.y) });
-      }
-    }
-    return out;
-  }
-
-  function mergeToolAndScoopsContour(toolPoly, scoops, binHalfW, binHalfH) {
-    if (!toolPoly || toolPoly.length < 3) return [];
-    let base = signedPolygonArea(toolPoly) < 0 ? toolPoly.slice().reverse() : toolPoly.slice();
-    base = densifyPolygon(base, 1.4);
-
-    scoops.forEach(sc => {
-      const arcSegs = 28;
-      const insideFlags = base.map(p => Math.hypot(p.x - sc.x, p.y - sc.y) < sc.r);
-      const firstIn = insideFlags.indexOf(true);
-      if (firstIn === -1 || !insideFlags.includes(false)) return;
-
-      let startOut = firstIn;
-      while (insideFlags[startOut]) startOut = (startOut - 1 + base.length) % base.length;
-      let enterIdx = (startOut + 1) % base.length;
-      let exitIdx = enterIdx;
-      while (insideFlags[exitIdx]) exitIdx = (exitIdx + 1) % base.length;
-
-      const pEnter = base[enterIdx];
-      const pExit = base[(exitIdx - 1 + base.length) % base.length];
-      let aStart = Math.atan2(pEnter.y - sc.y, pEnter.x - sc.x);
-      let aEnd = Math.atan2(pExit.y - sc.y, pExit.x - sc.x);
-
-      let delta = aEnd - aStart;
-      while (delta <= -Math.PI) delta += Math.PI * 2;
-      while (delta > Math.PI) delta -= Math.PI * 2;
-      const midA1 = aStart + delta * 0.5;
-      const testPt = { x: sc.x + Math.cos(midA1) * sc.r * 0.95, y: sc.y + Math.sin(midA1) * sc.r * 0.95 };
-      if (pointInPolygon(testPt.x, testPt.y, base)) {
-        delta = delta > 0 ? delta - Math.PI * 2 : delta + Math.PI * 2;
-      }
-
-      const arcPts = [];
-      // Skip k=0 and k=arcSegs duplicate corner pins to avoid sharp bowtie kinks at scoop junctions
-      for (let k = 1; k < arcSegs; k++) {
-        const a = aStart + (k / arcSegs) * delta;
-        arcPts.push({ x: sc.x + Math.cos(a) * sc.r, y: sc.y + Math.sin(a) * sc.r });
-      }
-
-      const rebuilt = [];
-      let curr = exitIdx;
-      while (curr !== enterIdx) {
-        rebuilt.push(base[curr]);
-        curr = (curr + 1) % base.length;
-      }
-      rebuilt.push(...arcPts);
-      base = rebuilt;
-    });
-
-    const maxW = binHalfW - 1.5, maxH = binHalfH - 1.5;
-    const clamped = base.map(p => ({
-      x: Math.max(-maxW, Math.min(maxW, p.x)),
-      y: Math.max(-maxH, Math.min(maxH, p.y))
-    }));
-
-    // De-duplicate any collinear/clamped vertices closer than 0.5mm so Earcut never sees degenerate zero-length edges
-    const clean = [];
-    for (let i = 0; i < clamped.length; i++) {
-      const pt = clamped[i];
-      const prev = clean[clean.length - 1];
-      if (!prev || Math.hypot(pt.x - prev.x, pt.y - prev.y) > 0.5) {
-        clean.push(pt);
-      }
-    }
-    if (clean.length > 2 && Math.hypot(clean[0].x - clean[clean.length - 1].x, clean[0].y - clean[clean.length - 1].y) <= 0.5) {
-      clean.pop();
-    }
-    return clean;
-  }
-
   function triangulate2DWithHoles(outerPts, holePtsArray = []) {
     const contourV2 = outerPts.map(p => new THREE.Vector2(p.x, p.y));
     const holesV2 = holePtsArray.map(h => h.map(p => new THREE.Vector2(p.x, p.y)));
@@ -657,92 +662,37 @@
   }
 
   function evalToolFloorZ(localY, minY, maxY, hProfile, baseFloorZ, topZ, useSupport) {
-    if (!useSupport || !hProfile || hProfile.length < 2) return baseFloorZ;
+    if (!useSupport) return baseFloorZ;
+    const pocketDepth = topZ - baseFloorZ;
+    // t = 0.0 is the TOP tip of the tool (minimum Y), t = 1.0 is the BOTTOM base of the handle (maximum Y)
     const t = Math.max(0, Math.min(1, (localY - minY) / Math.max(1, maxY - minY)));
-    const exactIdx = t * (hProfile.length - 1);
-    const i0 = Math.floor(exactIdx), i1 = Math.min(hProfile.length - 1, i0 + 1);
-    const f = exactIdx - i0;
-    const zSupport = hProfile[i0].zBottom * (1 - f) + hProfile[i1].zBottom * f;
-    const raisedZ = baseFloorZ + Math.max(0, zSupport - 0.3);
-    return Math.min(topZ - 2.0, raisedZ);
-  }
+    let zSupport = 0;
 
-  // Subdivided Y-Grid Floor Mesher: prevents long diagonal Earcut triangles from cutting across 3D curved floors
-  // ???
-  function buildSubdividedFloorMesh(verts, faces, polyCCW, evalZFn, flipNormal = false) {
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    polyCCW.forEach(p => {
-      if (p.x < minX) minX = p.x;
-      if (p.x > maxX) maxX = p.x;
-      if (p.y < minY) minY = p.y;
-      if (p.y > maxY) maxY = p.y;
-    });
-
-    // Use Earcut on the boundary, then recursively split any triangle whose span > 8mm
-    // so the floor conforms smoothly to the Y-height profile without diagonal ridges.
-    const n = polyCCW.length;
-    const baseIdx = verts.length;
-    polyCCW.forEach(p => verts.push([p.x, p.y, evalZFn(p.x, p.y)]));
-
-    const rawTris = triangulate2DWithHoles(polyCCW, []);
-    const vertCache = new Map();
-
-    function getMidIdx(iA, iB) {
-      const key = iA < iB ? `${iA}_${iB}` : `${iB}_${iA}`;
-      if (vertCache.has(key)) return vertCache.get(key);
-      const vA = verts[iA], vB = verts[iB];
-      const mx = 0.5 * (vA[0] + vB[0]);
-      const my = 0.5 * (vA[1] + vB[1]);
-      const idx = verts.length;
-      verts.push([mx, my, evalZFn(mx, my)]);
-      vertCache.set(key, idx);
-      return idx;
+    if (hProfile && hProfile.length >= 2) {
+      const exactIdx = t * (hProfile.length - 1);
+      const i0 = Math.floor(exactIdx), i1 = Math.min(hProfile.length - 1, i0 + 1);
+      const f = exactIdx - i0;
+      zSupport = hProfile[i0].zBottom * (1 - f) + hProfile[i1].zBottom * f;
     }
 
-    function emitSubdivided(i0, i1, i2, depth) {
-      const v0 = verts[i0], v1 = verts[i1], v2 = verts[i2];
-      const d01 = Math.hypot(v1[0] - v0[0], v1[1] - v0[1]);
-      const d12 = Math.hypot(v2[0] - v1[0], v2[1] - v1[1]);
-      const d20 = Math.hypot(v0[0] - v2[0], v0[1] - v2[1]);
-      const maxEdge = Math.max(d01, d12, d20);
-
-      if (depth < 3 && maxEdge > 9.0) {
-        if (d01 >= d12 && d01 >= d20) {
-          const m = getMidIdx(i0, i1);
-          emitSubdivided(i0, m, i2, depth + 1);
-          emitSubdivided(m, i1, i2, depth + 1);
-        } else if (d12 >= d01 && d12 >= d20) {
-          const m = getMidIdx(i1, i2);
-          emitSubdivided(i0, i1, m, depth + 1);
-          emitSubdivided(i0, m, i2, depth + 1);
-        } else {
-          const m = getMidIdx(i2, i0);
-          emitSubdivided(i0, i1, m, depth + 1);
-          emitSubdivided(m, i1, i2, depth + 1);
-        }
-        return;
-      }
-      if (flipNormal) {
-        faces.push([i0, i2, i1]);
-      } else {
-        faces.push([i0, i1, i2]);
-      }
+    // Fallback smooth upward ramp under the top 36% of the tool if side profile wasn't uploaded yet
+    if (zSupport < 0.5 && t < 0.36) {
+      const ramp = (0.36 - t) / 0.36;
+      zSupport = Math.pow(ramp, 1.15) * (pocketDepth * 0.68);
     }
 
-    rawTris.forEach(([a, b, c]) => {
-      emitSubdivided(baseIdx + a, baseIdx + b, baseIdx + c, 0);
-    });
-    return baseIdx;
+    const raisedZ = baseFloorZ + Math.max(0, zSupport - 0.25);
+    return Math.min(topZ - 1.5, raisedZ);
   }
 
-  function addContouredPolygonPrism(verts, faces, poly2D, tool, minY, maxY, hProf, baseFloorZ, zTop, useSupport) {
+  function addFlatPolygonPrism(verts, faces, poly2D, z0, z1) {
     if (!poly2D || poly2D.length < 3) return;
     const pts = signedPolygonArea(poly2D) < 0 ? poly2D.slice().reverse() : poly2D.slice();
     const n = pts.length;
     const baseIdx = verts.length;
 
-    pts.forEach(p => verts.push([p.x, p.y, baseFloorZ]));
-    pts.forEach(p => verts.push([p.x, p.y, zTop]));
+    pts.forEach(p => verts.push([p.x, p.y, z0]));
+    pts.forEach(p => verts.push([p.x, p.y, z1]));
 
     const tris = triangulate2DWithHoles(pts, []);
     tris.forEach(([a, b, c]) => {
@@ -763,15 +713,14 @@
     const topZ = p.totalZ;
     const pocketDepth = Math.min(p.totalZ - 4.8, p.pocketDepth);
     const pocketFloorZ = topZ - pocketDepth;
-    const binHalfW = p.binW / 2, binHalfH = p.binH / 2;
 
     const holePolys = [];
     const negVerts = [], negFaces = [];
+    const saddleVerts = [], saddleFaces = [];
     const snapVerts = [], snapFaces = [];
 
     window.AppState.placedTools.forEach(t => {
-      const offLocal = offsetPolygon(t.contourMm, p.clearance);
-      const offWorld = offLocal.map(pt => transformPt(pt, t.xMm, t.yMm, t.rotDeg));
+      const worldRaw = t.contourMm.map(pt => transformPt(pt, t.xMm, t.yMm, t.rotDeg));
       const scoopsWorld = (t.scoops || []).map(sc => ({
         ...transformPt(sc, t.xMm, t.yMm, t.rotDeg),
         r: p.scoopR
@@ -779,15 +728,15 @@
 
       let minY = Infinity, maxY = -Infinity;
       t.contourMm.forEach(pt => { if (pt.y < minY) minY = pt.y; if (pt.y > maxY) maxY = pt.y; });
-      const hProf = (t.heightProfile && t.heightProfile.length) ? t.heightProfile : (window.AppState.activeHeightProfile || []);
+      const hProf = (window.AppState.activeHeightProfile && window.AppState.activeHeightProfile.length)
+        ? window.AppState.activeHeightProfile
+        : (t.heightProfile || []);
 
-      const mergedHole = mergeToolAndScoopsContour(offWorld, scoopsWorld, binHalfW, binHalfH);
+      // 1. Unified contour via 2D Canvas SDF rasterization (never drops a scoop or self-intersects!)
+      const mergedHole = buildUnifiedPocketContour(worldRaw, scoopsWorld, p.clearance, p.binW, p.binH);
       if (mergedHole.length >= 3) {
         holePolys.push({ poly: mergedHole, tool: t, minY, maxY, hProf });
-        addContouredPolygonPrism(
-          negVerts, negFaces, mergedHole, t, minY, maxY, hProf,
-          pocketFloorZ, topZ + (p.lip ? 4.4 : 0.4), p.useFloorSupport
-        );
+        addFlatPolygonPrism(negVerts, negFaces, mergedHole, pocketFloorZ, topZ + (p.lip ? 4.4 : 0.4));
       }
     });
 
@@ -796,7 +745,7 @@
     const outerCCW = signedPolygonArea(outerRim) < 0 ? outerRim.slice().reverse() : outerRim;
     const holesCW = holePolys.map(item => (signedPolygonArea(item.poly) > 0 ? item.poly.slice().reverse() : item.poly.slice()));
 
-    // A. Top Surface with Clean, Exact Carved Pocket Holes (Zero Self-Intersecting Chamfer Offset)
+    // A. Top Surface with Clean, Exact Carved Pocket Holes
     const topStartIdx = binVerts.length;
     outerCCW.forEach(pt => binVerts.push([pt.x, pt.y, topZ]));
     const holeStartIndices = [];
@@ -810,84 +759,132 @@
       binFaces.push([topStartIdx + a, topStartIdx + b, topStartIdx + c]);
     });
 
-
-    // B. Crisp Vertical Pocket Walls, Clean Flat Pocket Floor & Tangent-Aligned Snap Clips
+    // B. Solid Flat Pocket Floor + Explicit Sloped Under-Support Saddle + Inward Snap Clips
     holesCW.forEach((h, hIdx) => {
-      const { tool } = holePolys[hIdx];
+      const { tool, minY, maxY, hProf } = holePolys[hIdx];
       const n = h.length;
       const topHoleIdx = holeStartIndices[hIdx];
 
-      // 1. Add floor vertices at pocketFloorZ in CW order matching h
-      const flIdx = binVerts.length;
+      // 1. Vertical Pocket Walls down to flat pocketFloorZ
+      const flWallIdx = binVerts.length;
       h.forEach(pt => binVerts.push([pt.x, pt.y, pocketFloorZ]));
-
-      // 2. Vertical Pocket Walls
       for (let i = 0; i < n; i++) {
         const next = (i + 1) % n;
         binFaces.push(
-          [topHoleIdx + i, flIdx + i, flIdx + next],
-          [topHoleIdx + i, flIdx + next, topHoleIdx + next]
+          [topHoleIdx + i, flWallIdx + i, flWallIdx + next],
+          [topHoleIdx + i, flWallIdx + next, topHoleIdx + next]
         );
       }
 
-      // 3. Clean Planar Pocket Floor (triangulate CCW copy so Earcut indices stay aligned)
-      const h_CCW = h.slice().reverse();
-      const floorTris = triangulate2DWithHoles(h_CCW, []);
+      // 2. Rock-Solid Flat Pocket Floor Cap at pocketFloorZ
+      const hPos = h.slice().reverse();
+      const flCapIdx = binVerts.length;
+      hPos.forEach(pt => binVerts.push([pt.x, pt.y, pocketFloorZ]));
+      const floorTris = triangulate2DWithHoles(hPos, []);
       floorTris.forEach(([a, b, c]) => {
-        binFaces.push([flIdx + (n - 1 - a), flIdx + (n - 1 - b), flIdx + (n - 1 - c)]);
+        binFaces.push([flCapIdx + a, flCapIdx + b, flCapIdx + c]);
       });
 
-      // 4. Clean Tangent-Aligned Snap-Fit Clips
+      // 3. Explicit Sloped Under-Support Saddle (Watertight 3D ramp under the top of the tool!)
+      // Built along the tool's local Y axis inside the offset tool contour (excluding finger scoops
+      // so your fingers can always slide all the way under the tool at the scoops!).
+      if (p.useFloorSupport) {
+        const localToolOffset = offsetPolygon(tool.contourMm, p.clearance * 0.85);
+        const slices = 44;
+        const bands = [];
+        for (let s = 0; s <= slices; s++) {
+          const tNorm = s / slices;
+          const localY = minY + 0.6 + tNorm * (maxY - minY - 1.2);
+          const zFloor = evalToolFloorZ(localY, minY, maxY, hProf, pocketFloorZ, topZ, true);
+
+          const xHits = [];
+          for (let i = 0; i < localToolOffset.length; i++) {
+            const p0 = localToolOffset[i], p1 = localToolOffset[(i + 1) % localToolOffset.length];
+            if ((p0.y <= localY && p1.y > localY) || (p1.y <= localY && p0.y > localY)) {
+              xHits.push(p0.x + ((localY - p0.y) / (p1.y - p0.y)) * (p1.x - p0.x));
+            }
+          }
+          xHits.sort((a, b) => a - b);
+          if (xHits.length >= 2) {
+            const xL = xHits[0], xR = xHits[xHits.length - 1];
+            if (xR > xL + 0.8) {
+              const wL = transformPt({ x: xL, y: localY }, tool.xMm || 0, tool.yMm || 0, tool.rotDeg || 0);
+              const wR = transformPt({ x: xR, y: localY }, tool.xMm || 0, tool.yMm || 0, tool.rotDeg || 0);
+              bands.push({ wL, wR, z: zFloor });
+            }
+          }
+        }
+
+        const pushSaddleTo = (vArr, fArr) => {
+          for (let s = 0; s < bands.length - 1; s++) {
+            const b0 = bands[s], b1 = bands[s + 1];
+            if (b0.z <= pocketFloorZ + 0.1 && b1.z <= pocketFloorZ + 0.1) continue;
+            const sb = vArr.length;
+            vArr.push([b0.wL.x, b0.wL.y, b0.z]);         // 0: Top Left s
+            vArr.push([b0.wR.x, b0.wR.y, b0.z]);         // 1: Top Right s
+            vArr.push([b1.wL.x, b1.wL.y, b1.z]);         // 2: Top Left s+1
+            vArr.push([b1.wR.x, b1.wR.y, b1.z]);         // 3: Top Right s+1
+            vArr.push([b0.wL.x, b0.wL.y, pocketFloorZ]); // 4: Bot Left s
+            vArr.push([b0.wR.x, b0.wR.y, pocketFloorZ]); // 5: Bot Right s
+            vArr.push([b1.wL.x, b1.wL.y, pocketFloorZ]); // 6: Bot Left s+1
+            vArr.push([b1.wR.x, b1.wR.y, pocketFloorZ]); // 7: Bot Right s+1
+
+            // Top sloped ramp surface (+Z normal), side skirts, and front/back endcaps
+            fArr.push(
+              [sb + 0, sb + 3, sb + 2], [sb + 0, sb + 1, sb + 3], // Top sloped ramp (+Z)
+              [sb + 0, sb + 2, sb + 6], [sb + 0, sb + 6, sb + 4], // Left skirt
+              [sb + 1, sb + 7, sb + 3], [sb + 1, sb + 5, sb + 7], // Right skirt
+              [sb + 0, sb + 5, sb + 1], [sb + 0, sb + 4, sb + 5], // Back wall
+              [sb + 2, sb + 3, sb + 7], [sb + 2, sb + 7, sb + 6]  // Front step wall
+            );
+          }
+        };
+
+        pushSaddleTo(binVerts, binFaces);
+        pushSaddleTo(saddleVerts, saddleFaces);
+      }
+
+      // 4. Deterministic Inward Snap-Fit Retention Clips
       (tool.snaps || []).forEach(sn => {
         const wSn = transformPt(sn, tool.xMm || 0, tool.yMm || 0, tool.rotDeg || 0);
         let bestIdx = 0, bestD = Infinity;
-        h_CCW.forEach((pt, idx) => {
+        hPos.forEach((pt, idx) => {
           const d = Math.hypot(pt.x - wSn.x, pt.y - wSn.y);
           if (d < bestD) { bestD = d; bestIdx = idx; }
         });
 
-        // Average tangent over a wider +/- 4 vertex window so the clip is straight and smooth
-        const pPrev = h_CCW[(bestIdx - 4 + n) % n];
-        const pCurr = h_CCW[bestIdx];
-        const pNext = h_CCW[(bestIdx + 4) % n];
+        const pPrev = hPos[(bestIdx - 3 + n) % n];
+        const pCurr = hPos[bestIdx];
+        const pNext = hPos[(bestIdx + 3) % n];
         const tx = pNext.x - pPrev.x, ty = pNext.y - pPrev.y;
         const tl = Math.hypot(tx, ty) || 1;
-        let ux = tx / tl, uy = ty / tl;
-        let nx = -uy, ny = ux;
-
-        // Verify (nx, ny) points INWARD into the pocket hole
-        if (!pointInPolygon(pCurr.x + nx * 2.0, pCurr.y + ny * 2.0, h_CCW)) {
-          nx = -nx; ny = -ny;
-        }
-        // Keep right-handed frame (u x n = +Z)
-        if (ux * ny - uy * nx < 0) {
-          ux = -ux; uy = -uy;
-        }
+        const ux = tx / tl, uy = ty / tl;
+        const nx = ty / tl, ny = -tx / tl;
 
         const halfW = (sn.width || 10.0) * 0.5;
-        const ov = Math.max(1.0, p.snapOverhang * 1.5);
-        const zTopLip = topZ - 0.3;
-        const zNoseTop = topZ - 1.5;
-        const zNoseBot = topZ - 2.5;
-        const zBotLip = Math.max(pocketFloorZ + 0.5, topZ - 4.5);
+        const ov = Math.max(1.8, p.snapOverhang * 2.4);
+        const zTopLip = topZ - 0.2;
+        const zNoseTop = topZ - 1.4;
+        const zNoseBot = topZ - 2.6;
+        const zBotLip = Math.max(pocketFloorZ + 0.5, topZ - 4.8);
 
         const addClipBox = (vArr, fArr) => {
           const sBase = vArr.length;
           [-halfW, halfW].forEach(s => {
-            const wx = pCurr.x + ux * s - nx * 0.6, wy = pCurr.y + uy * s - ny * 0.6;
+            const wx = pCurr.x + ux * s - nx * 0.3, wy = pCurr.y + uy * s - ny * 0.3;
             const tipX = pCurr.x + ux * s + nx * ov, tipY = pCurr.y + uy * s + ny * ov;
-            vArr.push([wx, wy, zTopLip]);    // 0, 4
-            vArr.push([tipX, tipY, zNoseTop]); // 1, 5
-            vArr.push([tipX, tipY, zNoseBot]); // 2, 6
-            vArr.push([wx, wy, zBotLip]);    // 3, 7
+            vArr.push([wx, wy, zTopLip]);
+            vArr.push([tipX, tipY, zNoseTop]);
+            vArr.push([tipX, tipY, zNoseBot]);
+            vArr.push([wx, wy, zBotLip]);
           });
           fArr.push(
-            [sBase + 0, sBase + 1, sBase + 5], [sBase + 0, sBase + 5, sBase + 4],
-            [sBase + 1, sBase + 2, sBase + 6], [sBase + 1, sBase + 6, sBase + 5],
-            [sBase + 2, sBase + 3, sBase + 7], [sBase + 2, sBase + 7, sBase + 6],
-            [sBase + 0, sBase + 4, sBase + 7], [sBase + 0, sBase + 7, sBase + 3],
-            [sBase + 0, sBase + 3, sBase + 2], [sBase + 0, sBase + 2, sBase + 1],
-            [sBase + 4, sBase + 5, sBase + 6], [sBase + 4, sBase + 6, sBase + 7]
+            [sBase + 0, sBase + 5, sBase + 1], [sBase + 0, sBase + 4, sBase + 5],
+            [sBase + 1, sBase + 6, sBase + 2], [sBase + 1, sBase + 5, sBase + 6],
+            [sBase + 2, sBase + 7, sBase + 3], [sBase + 2, sBase + 6, sBase + 7],
+            [sBase + 0, sBase + 7, sBase + 4], [sBase + 0, sBase + 3, sBase + 7],
+            [sBase + 0, sBase + 2, sBase + 3], [sBase + 0, sBase + 1, sBase + 2],
+            [sBase + 4, sBase + 6, sBase + 5], [sBase + 4, sBase + 7, sBase + 6]
           );
         };
 
@@ -896,7 +893,7 @@
       });
     });
 
-    // C. Outer Bin Perimeter Walls (Outward) & Bottom Base (-Z)
+    // C. Outer Bin Perimeter Walls & Bottom Base
     const botWallZ = p.flatBase ? 0.0 : 4.75;
     const botRimIdx = binVerts.length;
     outerCCW.forEach(pt => binVerts.push([pt.x, pt.y, botWallZ]));
@@ -964,6 +961,7 @@
 
     mode2Meshes = {
       bin: { vertices: binVerts, faces: binFaces },
+      saddle: { vertices: saddleVerts, faces: saddleFaces },
       neg: { vertices: negVerts, faces: negFaces },
       snaps: { vertices: snapVerts, faces: snapFaces }
     };
@@ -972,7 +970,7 @@
 
   function rebuildMode2ThreeJS() {
     renderGf2D();
-    const { bin, neg, snaps } = buildMode2Meshes();
+    const { bin, saddle, neg, snaps } = buildMode2Meshes();
     while (vpMode2.rootGroup.children.length > 0) vpMode2.rootGroup.remove(vpMode2.rootGroup.children[0]);
 
     if (bin.faces.length > 0) {
@@ -980,18 +978,35 @@
       const binMat = new THREE.MeshStandardMaterial({
         color: 0x334155,
         roughness: 0.38,
-        metalness: 0.12
+        metalness: 0.12,
+        side: THREE.DoubleSide
       });
       vpMode2.rootGroup.add(new THREE.Mesh(binGeom, binMat));
     }
 
-    // Highlight Snap-Fit Retention Clips in distinct purple so they are clearly visible over the pocket wall
+    // Highlight the Sloped Under-Support Saddle in emerald green so you can clearly see the upward ramp!
+    if (saddle && saddle.faces.length > 0) {
+      const sadGeom = indexedMeshToThreeGeometry(saddle);
+      const sadMat = new THREE.MeshStandardMaterial({
+        color: 0x10b981,
+        roughness: 0.32,
+        metalness: 0.1,
+        side: THREE.DoubleSide,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1
+      });
+      vpMode2.rootGroup.add(new THREE.Mesh(sadGeom, sadMat));
+    }
+
+    // Highlight Snap-Fit Retention Clips in purple
     if (snaps && snaps.faces.length > 0) {
       const snapGeom = indexedMeshToThreeGeometry(snaps);
       const snapMat = new THREE.MeshStandardMaterial({
         color: 0xa855f7,
         roughness: 0.28,
         metalness: 0.15,
+        side: THREE.DoubleSide,
         polygonOffset: true,
         polygonOffsetFactor: -1,
         polygonOffsetUnits: -1
@@ -1006,12 +1021,13 @@
         transparent: true,
         opacity: 0.22,
         roughness: 0.3,
-        depthWrite: false
+        depthWrite: false,
+        side: THREE.DoubleSide
       });
       vpMode2.rootGroup.add(new THREE.Mesh(negGeom, negMat));
     }
     vpMode2.updateCam();
-    gfStatus.textContent = `Exact Vector 3D Bin: ${bin.faces.length.toLocaleString()} tris | Negative: ${neg.faces.length.toLocaleString()} tris.`;
+    gfStatus.textContent = `3D Bin Built: ${bin.faces.length.toLocaleString()} tris | Support Saddle: ${saddle.faces.length} tris | Snaps:${snaps.faces.length} tris.`;
   }
 
   // ==================== 5. MODE 1: WATERTIGHT 3D TOOL RECONSTRUCTOR + TAUBIN SMOOTHING ====================
@@ -1054,19 +1070,18 @@
         cx = rings[s - 1].cx;
       }
 
-	// Taper thickness smoothly to 0 at the very ends (t < 0.04 and t > 0.96) and clamp outliers
-      const tipTaper = Math.min(1.0, Math.min(t / 0.04, (1.0 - t) / 0.04));
-      let zBot = 0, zTop = defaultZ;
-      if (hProf.length > 1) {
-        const hIdx = Math.min(hProf.length - 1, Math.floor(t * hProf.length));
-        zBot = Math.max(0, Math.min(defaultZ * 0.45, (hProf[hIdx].zBottom || 0) - boolOffset));
-        zTop = Math.min(defaultZ * 1.25, (hProf[hIdx].zTop || defaultZ) + boolOffset);
-      }
-      const midZ = (zBot + zTop) * 0.5;
-      const halfThick = Math.max(0.4, (zTop - zBot) * 0.5 * tipTaper);
-      zBot = midZ - halfThick;
-      zTop = midZ + halfThick;
-      
+      const tipTaper = Math.min(1.0, Math.min(t / 0.04, (1.0 - t) / 0.04));
+      let zBot = 0, zTop = defaultZ;
+      if (hProf.length > 1) {
+        const hIdx = Math.min(hProf.length - 1, Math.floor(t * hProf.length));
+        zBot = Math.max(0, Math.min(defaultZ * 0.65, (hProf[hIdx].zBottom || 0) - boolOffset));
+        zTop = Math.min(defaultZ * 1.25, (hProf[hIdx].zTop || defaultZ) + boolOffset);
+      }
+      const midZ = (zBot + zTop) * 0.5;
+      const halfThick = Math.max(0.4, (zTop - zBot) * 0.5 * tipTaper);
+      zBot = midZ - halfThick;
+      zTop = midZ + halfThick;
+
       const cz = (zBot + zTop) * 0.5;
       const rz = Math.max(1.2, (zTop - zBot) * 0.5);
 
@@ -1132,7 +1147,12 @@
     window.AppState.mode1Mesh = { vertices, faces };
     while (vpMode1.rootGroup.children.length > 0) vpMode1.rootGroup.remove(vpMode1.rootGroup.children[0]);
     const geom = indexedMeshToThreeGeometry(window.AppState.mode1Mesh);
-    const mat = new THREE.MeshStandardMaterial({ color: 0x38bdf8, roughness: 0.32, metalness: 0.55 });
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0x38bdf8,
+      roughness: 0.32,
+      metalness: 0.55,
+      side: THREE.DoubleSide
+    });
     vpMode1.rootGroup.add(new THREE.Mesh(geom, mat));
     vpMode1.updateCam();
     m1Status.textContent = `Watertight Manifold Reconstructed: ${vertices.length} vertices,${faces.length} triangles.`;
@@ -1142,9 +1162,8 @@
   function meshToAsciiStl(mesh, solidName = 'toolscan_mesh') {
     const out = [`solid ${solidName}`];
     for (let [a, b, c] of mesh.faces) {
-      // Swap b and c to compensate for -v[1] reflection
       const v0 = mesh.vertices[a], v1 = mesh.vertices[c], v2 = mesh.vertices[b];
-      out.push(`facet normal 0 0 0\nouter loop\nvertex ${v0[0].toFixed(3)} ${(-v0[1]).toFixed(3)} ${v0[2].toFixed(3)}\nvertex ${v1[0].toFixed(3)} ${(-v1[1]).toFixed(3)} ${v1[2].toFixed(3)}\nvertex ${v2[0].toFixed(3)} ${(-v2[1]).toFixed(3)} ${v2[2].toFixed(3)}\nendloop\nendfacet`);
+      out.push(`facet normal 0 0 0\nouter loop\nvertex ${v0[0].toFixed(3)} ${(-v0[1]).toFixed(3)}${v0[2].toFixed(3)}\nvertex ${v1[0].toFixed(3)}${(-v1[1]).toFixed(3)} ${v1[2].toFixed(3)}\nvertex${v2[0].toFixed(3)} ${(-v2[1]).toFixed(3)}${v2[2].toFixed(3)}\nendloop\nendfacet`);
     }
     out.push(`endsolid ${solidName}`);
     return out.join('\n');
@@ -1207,7 +1226,7 @@
     window.AppState.downloadBlob(blob, filename);
   }
 
-  function generateMode2OpenSCAD() {
+function generateMode2OpenSCAD() {
     const p = getGfParams();
     const lines = [
       `// ============================================================================`,
@@ -1238,7 +1257,7 @@
       `include_text_labels = true;`,
       `text_font = "Liberation Sans:style=Bold";`,
       `text_size = 4.20;`,
-      `text_depth = -0.60; // Positive = embossed (raised), Negative = debossed (engraved)`,
+      `text_depth = -0.60;`,
       `text_offset_y = 0.0;`,
       ``,
       `/* [Baseplate Magnet & Screw Options] */`,
@@ -1369,7 +1388,7 @@
       `  }`,
       `}`,
       ``,
-      `// ---- Raised Under-Support Floor Saddle & Snap-Fit Clips (Added back into pocket) ----`,
+      `// ---- Raised Under-Support Floor Saddle & Snap-Fit Clips ----`,
       `module tool_positive_features() {`
     ];
 
@@ -1377,36 +1396,35 @@
       const ptsStr = t.contourMm.map(pt => `[${pt.x.toFixed(2)},${(-pt.y).toFixed(2)}]`).join(', ');
       let minY = Infinity, maxY = -Infinity;
       t.contourMm.forEach(pt => { if (pt.y < minY) minY = pt.y; if (pt.y > maxY) maxY = pt.y; });
-      const hProf = (t.heightProfile && t.heightProfile.length) ? t.heightProfile : (window.AppState.activeHeightProfile || []);
+      const hProf = (window.AppState.activeHeightProfile && window.AppState.activeHeightProfile.length)
+        ? window.AppState.activeHeightProfile
+        : (t.heightProfile || []);
 
       lines.push(`  translate([${t.xMm.toFixed(2)}, ${(-t.yMm).toFixed(2)}, 0]) rotate([0, 0,${(-t.rotDeg).toFixed(2)}]) {`);
+      lines.push(`    if (use_contoured_floor_support) {`);
+      lines.push(`      intersection() {`);
+      lines.push(`        translate([0, 0, pocket_floor_z]) linear_extrude(height = pocket_depth) offset(r = clearance) polygon(points = [${ptsStr}]);`);
+      lines.push(`        union() {`);
 
-      // 1. Contoured under-support floor slices in the green zone
-      if (hProf.length > 1) {
-        lines.push(`    if (use_contoured_floor_support) {`);
-        lines.push(`      intersection() {`);
-        lines.push(`        translate([0, 0, pocket_floor_z]) linear_extrude(height = pocket_depth) offset(r = clearance) polygon(points = [${ptsStr}]);`);
-        lines.push(`        union() {`);
-        const numSlices = 20;
-        const sliceLen = (maxY - minY) / numSlices;
-        for (let s = 0; s < numSlices; s++) {
-          const tNorm = (s + 0.5) / numSlices;
-          const hIdx = Math.min(hProf.length - 1, Math.floor(tNorm * hProf.length));
-          const zSup = Math.max(0, (hProf[hIdx].zBottom || 0) - 0.3);
-          if (zSup > 0.3) {
-            const yCenterOpenSCAD = -(minY + (s + 0.5) * sliceLen);
-            lines.push(`          translate([0, ${yCenterOpenSCAD.toFixed(2)}, pocket_floor_z +${(zSup / 2).toFixed(2)}]) cube([200, ${(sliceLen + 0.4).toFixed(2)},${zSup.toFixed(2)}], center = true);`);
-          }
+      const numSlices = 24;
+      const sliceLen = (maxY - minY) / numSlices;
+      for (let s = 0; s < numSlices; s++) {
+        const localY = minY + (s + 0.5) * sliceLen;
+        const zFloor = evalToolFloorZ(localY, minY, maxY, hProf, p.totalZ - p.pocketDepth, p.totalZ, true);
+        const zSup = Math.max(0, zFloor - (p.totalZ - p.pocketDepth));
+        if (zSup > 0.25) {
+          const yCenterOpenSCAD = -localY;
+          lines.push(`          translate([0, ${yCenterOpenSCAD.toFixed(2)}, pocket_floor_z +${(zSup / 2).toFixed(2)}]) cube([200, ${(sliceLen + 0.4).toFixed(2)},${zSup.toFixed(2)}], center = true);`);
         }
-        lines.push(`        }`);
-        lines.push(`      }`);
-        lines.push(`    }`);
       }
 
-      // 2. Snap-fit inward retention nubs
+      lines.push(`        }`);
+      lines.push(`      }`);
+      lines.push(`    }`);
+
       (t.snaps || []).forEach(sn => {
         const dirSign = sn.x < 0 ? 1 : -1;
-lines.push(`    translate([${sn.x.toFixed(2)},${(-sn.y).toFixed(2)}, total_z - 2.2]) rotate([90, 0, 0]) linear_extrude(height = ${(sn.width || 12).toFixed(1)}, center = true) polygon(points = [[0, 1.4], [${(dirSign * p.snapOverhang).toFixed(2)}, 0], [0, -1.6]]);`);
+        lines.push(`    translate([${sn.x.toFixed(2)},${(-sn.y).toFixed(2)}, total_z - 2.2]) rotate([90, 0, 0]) linear_extrude(height = ${(sn.width || 12).toFixed(1)}, center = true) polygon(points = [[0, 1.4], [${(dirSign * p.snapOverhang).toFixed(2)}, 0], [0, -1.6]]);`);
       });
 
       lines.push(`  }`);
@@ -1415,7 +1433,6 @@ lines.push(`    translate([${sn.x.toFixed(2)},${(-sn.y).toFixed(2)}, total_z - 2
     lines.push(
       `}`,
       ``,
-      `// ---- Compliant Flex Relief Slots Behind Snap Clips ----`,
       `module snap_relief_slots() {`,
       `  if (use_snap_flex_slots) {`
     );

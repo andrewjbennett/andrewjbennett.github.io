@@ -1,4 +1,4 @@
-// ==================== COMPLETE UPDATED COMPUTER VISION ENGINE (cv-engine.js) ====================
+// ==================== COMPLETE COMPUTER VISION ENGINE (cv-engine.js) ====================
 (function () {
   const cvCanvas = document.getElementById('cv-canvas');
   const cvCtx = cvCanvas.getContext('2d', { willReadFrequently: true });
@@ -113,7 +113,7 @@
     state.rawTopImg = off;
     state.fiducialCornersPx = srcQuad;
 
-    // Synthesize matching perspective Side-Profile image with arched neck under-support
+    // Synthesize matching perspective Side-Profile image with sloped top neck under-support
     const sideScene = document.createElement('canvas');
     sideScene.width = W; sideScene.height = H;
     const ssctx = sideScene.getContext('2d');
@@ -123,13 +123,14 @@
       ssctx.fillStyle = '#111';
       ssctx.fillRect(mx, my, mSz, mSz);
     });
-    ssctx.fillStyle = '#26303d';
-    for (let y = 155; y <= 845; y++) {
-      const t = (y - 155) / (845 - 155);
-      const zBotMm = (t > 0.16 && t < 0.84) ? Math.sin(((t - 0.16) / 0.68) * Math.PI) * 5.0 : 0.0;
-      const zTopMm = (t < 0.18 || t > 0.82) ? 14.0 : 9.5 + Math.sin(((t - 0.18) / 0.64) * Math.PI) * 3.0;
-      const xL = 260 + zBotMm * 4.0;
-      const xR = 260 + zTopMm * 4.0;
+    ssctx.fillStyle = '#dc2626';
+    for (let y = 160; y <= 840; y++) {
+      const t = (y - 160) / (840 - 160);
+      // Top 35% (t < 0.35) slopes upward from the resting surface like the otoscope neck
+      const zBotMm = t < 0.35 ? Math.pow((0.35 - t) / 0.35, 1.2) * 8.5 : 0.0;
+      const zTopMm = t < 0.35 ? zBotMm + 7.5 + t * 18.0 : 16.0;
+      const xL = 250 + zBotMm * 4.0;
+      const xR = 250 + zTopMm * 4.0;
       ssctx.fillRect(xL, y, Math.max(2, xR - xL), 1.5);
     }
     const sideOff = document.createElement('canvas');
@@ -226,7 +227,6 @@
     tctx.drawImage(img, 0, 0);
     const data = tctx.getImageData(0, 0, w, h).data;
 
-    // Step 1: Isolate bright white A4 paper bounding box to ignore wood/desk background
     let pMinX = w, pMaxX = 0, pMinY = h, pMaxY = 0;
     const step = Math.max(2, Math.floor(Math.min(w, h) / 250));
     for (let y = (h * 0.06) | 0; y < h * 0.94; y += step) {
@@ -248,13 +248,11 @@
     }
 
     const pw = pMaxX - pMinX, ph = pMaxY - pMinY;
-
-    // Step 2: Search inside each of the 4 paper corners for the black ArUco square centroid
     const quadrants = [
-      { x0: pMinX + pw * 0.015, y0: pMinY + ph * 0.015, x1: pMinX + pw * 0.22, y1: pMinY + ph * 0.24 }, // TL
-      { x0: pMaxX - pw * 0.22,  y0: pMinY + ph * 0.015, x1: pMaxX - pw * 0.015, y1: pMinY + ph * 0.24 }, // TR
-      { x0: pMaxX - pw * 0.22,  y0: pMaxY - ph * 0.24,  x1: pMaxX - pw * 0.015, y1: pMaxY - ph * 0.015 }, // BR
-      { x0: pMinX + pw * 0.015, y0: pMaxY - ph * 0.24,  x1: pMinX + pw * 0.22,  y1: pMaxY - ph * 0.015 }  // BL
+      { x0: pMinX + pw * 0.015, y0: pMinY + ph * 0.015, x1: pMinX + pw * 0.22, y1: pMinY + ph * 0.24 },
+      { x0: pMaxX - pw * 0.22,  y0: pMinY + ph * 0.015, x1: pMaxX - pw * 0.015, y1: pMinY + ph * 0.24 },
+      { x0: pMaxX - pw * 0.22,  y0: pMaxY - ph * 0.24,  x1: pMaxX - pw * 0.015, y1: pMaxY - ph * 0.015 },
+      { x0: pMinX + pw * 0.015, y0: pMaxY - ph * 0.24,  x1: pMinX + pw * 0.22,  y1: pMaxY - ph * 0.015 }
     ];
 
     const imgCorners = quadrants.map(q => {
@@ -273,7 +271,6 @@
         : { x: (q.x0 + q.x1) * 0.5, y: (q.y0 + q.y1) * 0.5 };
     });
 
-    // Step 3: Auto-detect Landscape vs Portrait orientation so 250mm always maps to H and 180mm maps to W
     const topSpan = Math.hypot(imgCorners[1].x - imgCorners[0].x, imgCorners[1].y - imgCorners[0].y);
     const leftSpan = Math.hypot(imgCorners[3].x - imgCorners[0].x, imgCorners[3].y - imgCorners[0].y);
 
@@ -342,7 +339,6 @@
       }
     }
 
-    // Specular Highlight Closing
     const closedMask = new Uint8Array(rawMask);
     const maxBridgeSpan = 44;
     for (let y = 32; y < H - 32; y++) {
@@ -452,15 +448,8 @@
       if (!foundNext || (cx === startX && cy === startY && rawPts.length > 10)) break;
     }
 
-    const calRef = document.getElementById('sel-cal-reference')?.value || 'both';
     const sheetW = window.AppState.calibration.sheetW || 180.0;
-    let pxPerMm = W / sheetW;
-    if (calRef === 'cube' || calRef === 'both') {
-      const cubeSizeMm = window.AppState.calibration.cubeSize || 50.0;
-      const detectedCubePx = cubeSizeMm * (W / sheetW);
-      const cubeScale = detectedCubePx / cubeSizeMm;
-      pxPerMm = calRef === 'cube' ? cubeScale : 0.5 * (pxPerMm + cubeScale);
-    }
+    const pxPerMm = W / sheetW;
     window.AppState.calibration.pxPerMm = pxPerMm;
 
     const rdpMm = parseFloat(document.getElementById('inp-rdp-eps').value) || 0.6;
@@ -584,7 +573,7 @@
     for (let y = 95; y < H - 95; y++) {
       let xMin = -1, xMax = -1;
       for (let x = 95; x < W - 95; x++) {
-        if (x > W * 0.56 && y < H * 0.34) continue; // Ignore 50x50mm cube dashed box
+        if (x > W * 0.56 && y < H * 0.34) continue;
         const i = (y * W + x) * 4;
         const [L, a, b] = rgbToLab(sData[i], sData[i + 1], sData[i + 2]);
         const luma = L * 2.55;
@@ -613,7 +602,6 @@
         if (rowLeft[y] !== -1) validLefts.push(rowLeft[y]);
       }
       validLefts.sort((a, b) => a - b);
-      // 10th percentile leftmost X = flat table resting surface (cyan line)
       const restingLineX = validLefts[Math.floor(validLefts.length * 0.10)];
 
       pctx.strokeStyle = '#06b6d4';
@@ -642,7 +630,6 @@
         const xL = cnt ? sumL / cnt : restingLineX;
         const xR = cnt ? sumR / cnt : restingLineX + 40;
 
-        // Green under-support height = gap between cyan resting line and tool underside
         const zBottomMm = Math.max(0, (xL - restingLineX) / pxPerMm);
         const zTopMm = Math.max(zBottomMm + 2.0, (xR - restingLineX) / pxPerMm);
         if (zTopMm > maxTopMm) maxTopMm = zTopMm;
@@ -660,6 +647,11 @@
       }
 
       window.AppState.activeHeightProfile = profile;
+      // Sync to all placed tools immediately so upload order never matters
+      window.AppState.placedTools.forEach(t => {
+        t.heightProfile = profile.slice();
+      });
+
       if (maxTopMm > 4 && maxTopMm < 65) {
         document.getElementById('inp-tool-thickness').value = maxTopMm.toFixed(1);
         if (document.getElementById('gf-pocket-depth')) {
@@ -668,7 +660,6 @@
       }
     }
 
-    // Fit preview nicely into sideCanvas
     sideCtx.fillStyle = '#090d12';
     sideCtx.fillRect(0, 0, sw, sh);
     const scale = Math.min(sw / W, sh / H);
@@ -881,34 +872,48 @@
     renderCVCanvas();
   });
 
-  // ==================== 10. DEFAULT SCOOPS, SNAP CLIPS & TOOL EXPORT ====================
-  function computeDefaultFingerScoops(contourMm) {
-    let leftPt = { x: -12, y: 0 }, rightPt = { x: 12, y: 0 };
-    let bestLeftX = -Infinity, bestRightX = Infinity;
-    contourMm.forEach(p => {
-      if (Math.abs(p.y) < 28) {
-        if (p.x < 0 && p.x > bestLeftX) { bestLeftX = p.x; leftPt = { x: p.x, y: p.y }; }
-        if (p.x >= 0 && p.x < bestRightX) { bestRightX = p.x; rightPt = { x: p.x, y: p.y }; }
+  // ==================== 10. SCANLINE-BASED SCOOPS, SNAP CLIPS & TOOL EXPORT ====================
+  // Raycast a horizontal line at `targetY` across `contourMm` so L-shaped tools
+  // find the true left and right walls of the handle shaft (even when shifted off X=0!)
+  function findHandleSpanAtY(contourMm, targetY) {
+    const xHits = [];
+    for (let i = 0; i < contourMm.length; i++) {
+      const a = contourMm[i], b = contourMm[(i + 1) % contourMm.length];
+      if ((a.y <= targetY && b.y > targetY) || (b.y <= targetY && a.y > targetY)) {
+        const x = a.x + ((targetY - a.y) / (b.y - a.y)) * (b.x - a.x);
+        xHits.push(x);
       }
-    });
+    }
+    if (xHits.length >= 2) {
+      xHits.sort((a, b) => a - b);
+      return { xLeft: xHits[0], xRight: xHits[xHits.length - 1], y: targetY };
+    }
+    return { xLeft: -12, xRight: 12, y: targetY };
+  }
+
+  function computeDefaultFingerScoops(contourMm) {
+    let minY = Infinity, maxY = -Infinity;
+    contourMm.forEach(p => { if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y; });
+    // Place finger scoops slightly below the center of the tool (on the main handle shaft)
+    const scoopY = minY + 0.55 * (maxY - minY);
+    const span = findHandleSpanAtY(contourMm, scoopY);
     const r = parseFloat(document.getElementById('gf-scoop-radius')?.value) || 11.0;
     return [
-      { x: leftPt.x - 2, y: leftPt.y, r },
-      { x: rightPt.x + 2, y: rightPt.y, r }
+      { x: span.xLeft - 1.5, y: span.y, r },
+      { x: span.xRight + 1.5, y: span.y, r }
     ];
   }
 
   function computeDefaultSnapClips(contourMm) {
-    let leftPt = { x: -12, y: 22 }, rightPt = { x: 12, y: 22 };
-    let bestLeftDist = Infinity, bestRightDist = Infinity;
-    contourMm.forEach(p => {
-      const dy = Math.abs(p.y - 22);
-      if (p.x < 0 && dy < bestLeftDist) { bestLeftDist = dy; leftPt = { x: p.x, y: p.y }; }
-      if (p.x > 0 && dy < bestRightDist) { bestRightDist = dy; rightPt = { x: p.x, y: p.y }; }
-    });
+    let minY = Infinity, maxY = -Infinity;
+    contourMm.forEach(p => { if (p.y < minY) minY = p.y; if (ptY(p) > maxY) maxY = p.y; });
+    function ptY(p) { return p.y; }
+    // Place opposing snap clips on the straight lower-middle handle walls (at 72% length)
+    const snapY = minY + 0.72 * (maxY - minY);
+    const span = findHandleSpanAtY(contourMm, snapY);
     return [
-      { x: leftPt.x, y: leftPt.y, width: 12.0 },
-      { x: rightPt.x, y: rightPt.y, width: 12.0 }
+      { x: span.xLeft, y: span.y, width: 12.0 },
+      { x: span.xRight, y: span.y, width: 12.0 }
     ];
   }
 
@@ -1006,6 +1011,7 @@
       state.rawTopImg = img;
       state.fiducialCornersPx = null;
       state.userMaskOverride.fill(0);
+      window.AppState.placedTools = [];
       runFullCVPipeline();
     };
     img.src = URL.createObjectURL(file);
@@ -1020,11 +1026,6 @@
       processSideProfile();
       updateMetricContourFromPx();
       renderCVCanvas();
-      // Update any already-placed tool with the newly extracted side height profile
-      const activeTool = window.AppState.placedTools[window.AppState.activeToolIndex];
-      if (activeTool) {
-        activeTool.heightProfile = (window.AppState.activeHeightProfile || []).slice();
-      }
     };
     img.src = URL.createObjectURL(file);
   });
